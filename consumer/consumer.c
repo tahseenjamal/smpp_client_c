@@ -402,6 +402,34 @@ void* smpp_read_loop(void* arg) {
 
 /* ------------------------------------------------ */
 
+void* smpp_worker_loop(void* arg) {
+    SmppWorker* w = (SmppWorker*)arg;
+
+    while (1) {
+        printf("[SMPP] Worker %d connecting...\n", w->id);
+
+        if (smpp_connect(w) != 0) {
+            sleep(3);
+            continue;
+        }
+
+        smpp_bind(w);
+
+        printf("[SMPP] Worker %d entering read loop\n", w->id);
+
+        smpp_read_loop(w);  // ← your existing read loop
+
+        printf("[SMPP] Worker %d disconnected\n", w->id);
+
+        close(w->socket);
+
+        sleep(3);
+    }
+
+    return NULL;
+}
+
+/* ------------------------------------------------ */
 int main() {
     if (load_config("config/gateway.conf") != 0) return 1;
 
@@ -436,7 +464,7 @@ int main() {
 
         smpp_bind(&workers[i]);
 
-        pthread_create(&workers[i].thread, NULL, smpp_read_loop, &workers[i]);
+        pthread_create(&workers[i].thread, NULL, smpp_worker_loop, &workers[i]);
     }
 
     jsCtx* js = NULL;
