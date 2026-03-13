@@ -1,0 +1,83 @@
+# -----------------------------
+
+# Build artifacts / executables
+
+# -----------------------------
+
+*.out
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Project binaries
+
+consumer-server
+producer-server
+producer_server
+logger-server
+
+# If you build other binaries later
+
+bin/
+build/
+
+# -----------------------------
+
+# Logs
+
+# -----------------------------
+
+logs/
+*.log
+
+# -----------------------------
+
+# Temporary files
+
+# -----------------------------
+
+*.tmp
+*.cache
+
+# -----------------------------
+
+# Editor swap files
+
+# -----------------------------
+
+*.swp
+*.swo
+*~
+
+# Vim swap directories
+
+.vim/
+
+# -----------------------------
+
+# macOS junk
+
+# -----------------------------
+
+.DS_Store
+
+# -----------------------------
+
+# IDE / editors
+
+# -----------------------------
+
+.vscode/
+.idea/
+
+# -----------------------------
+
+# Test / runtime files
+
+# -----------------------------
+
+*.pid
+*.lock
+

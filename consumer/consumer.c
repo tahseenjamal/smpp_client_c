@@ -1,87 +1,220 @@
 #include <arpa/inet.h>
 #include <nats/nats.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 
-#define SMPP_HOST "127.0.0.1"
-#define SMPP_PORT 2775
+#include "../common/config.h"
 
-#define SYSTEM_ID "test"
-#define PASSWORD "test"
-#define SYSTEM_TYPE ""
+int publish_event(natsConnection* conn, const char* subject,
+                  const char* payload);
 
 #define MAX_SEQ 10000
+#define MAX_WORKERS 16
+#define MAX_BODY 4096
+#define BATCH_SIZE 100
+#define WAIT_TIMEOUT 1000
+
+/* ---------------- Global TPS limiter ---------------- */
+
+static int global_tps = 0;
+static long send_interval_us = 0;
+
+static pthread_mutex_t tps_lock = PTHREAD_MUTEX_INITIALIZER;
+static long next_send_time_us = 0;
+
+/* ------------------------------------------------ */
 
 typedef struct {
     char txid[64];
     char text[512];
 } SeqMap;
 
-SeqMap seq_map[MAX_SEQ];
+typedef struct {
+    int id;
+    int socket;
+    pthread_t thread;
 
-static uint32_t seq = 1;
+    pthread_mutex_t lock;
 
-int smpp_socket = -1;
+    SeqMap seq_map[MAX_SEQ];
+    uint32_t seq;
+} SmppWorker;
 
-uint32_t next_seq() { return seq++; }
+SmppWorker workers[MAX_WORKERS];
+
+natsConnection* nc = NULL;
+
+int worker_count = 1;
+int rr = 0;
+
+/* ------------------------------------------------ */
+
+static long now_us() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (tv.tv_sec * 1000000L) + tv.tv_usec;
+}
+
+/* ------------------------------------------------ */
+
+static void global_tps_wait() {
+    if (send_interval_us <= 0) return;
+
+    pthread_mutex_lock(&tps_lock);
+
+    long now = now_us();
+
+    if (next_send_time_us == 0) next_send_time_us = now;
+
+    if (now < next_send_time_us) {
+        long sleep_us = next_send_time_us - now;
+        pthread_mutex_unlock(&tps_lock);
+        struct timespec ts;
+        ts.tv_sec = sleep_us / 1000000;
+        ts.tv_nsec = (sleep_us % 1000000) * 1000;
+        nanosleep(&ts, NULL);
+        pthread_mutex_lock(&tps_lock);
+    }
+
+    now = now_us();
+
+    if (now > next_send_time_us)
+        next_send_time_us = now + send_interval_us;
+    else
+        next_send_time_us += send_interval_us;
+
+    pthread_mutex_unlock(&tps_lock);
+}
+
+/* ------------------------------------------------ */
+
+int read_full(int sock, void* buf, int len) {
+    int total = 0;
+
+    while (total < len) {
+        int r = read(sock, (char*)buf + total, len - total);
+        if (r <= 0) return -1;
+
+        total += r;
+    }
+
+    return total;
+}
+
+/* ------------------------------------------------ */
+
+void extract_json(const char* json, const char* key, char* out, int max) {
+    char pattern[64];
+
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+
+    char* p = strstr(json, pattern);
+    if (!p) return;
+
+    p += strlen(pattern);
+
+    char* end = strchr(p, '"');
+    if (!end) return;
+
+    int len = end - p;
+
+    if (len >= max) len = max - 1;
+
+    memcpy(out, p, len);
+    out[len] = 0;
+}
+
+/* ------------------------------------------------ */
+
+uint32_t next_seq(SmppWorker* w) { return ++w->seq; }
+
+/* ------------------------------------------------ */
+
+void write_u32(uint8_t* buf, int offset, uint32_t value) {
+    uint32_t v = htonl(value);
+    memcpy(buf + offset, &v, 4);
+}
+
+/* ------------------------------------------------ */
+
+void read_u32(uint8_t* buf, int offset, uint32_t* out) {
+    memcpy(out, buf + offset, 4);
+    *out = ntohl(*out);
+}
+
+/* ------------------------------------------------ */
 
 void write_cstring(uint8_t* buf, int* pos, const char* str) {
     int len = strlen(str);
+
     memcpy(buf + *pos, str, len);
     *pos += len;
+
     buf[(*pos)++] = 0;
 }
 
-void send_pdu(uint8_t* pdu, int len) { write(smpp_socket, pdu, len); }
+/* ------------------------------------------------ */
 
-void smpp_connect() {
+int smpp_connect(SmppWorker* w) {
     struct sockaddr_in addr;
 
-    smpp_socket = socket(AF_INET, SOCK_STREAM, 0);
+    w->socket = socket(AF_INET, SOCK_STREAM, 0);
 
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(SMPP_PORT);
-    addr.sin_addr.s_addr = inet_addr(SMPP_HOST);
-
-    if (connect(smpp_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("SMPP connect");
-        exit(1);
+    if (w->socket < 0) {
+        perror("socket");
+        return -1;
     }
 
-    printf("SMPP connected\n");
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(config.smpp_port);
+    addr.sin_addr.s_addr = inet_addr(config.smpp_host);
+
+    if (connect(w->socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("SMPP connect");
+        return -1;
+    }
+
+    printf("[SMPP] Worker %d connected\n", w->id);
+
+    return 0;
 }
 
-void smpp_bind() {
+/* ------------------------------------------------ */
+
+void smpp_bind(SmppWorker* w) {
     uint8_t pdu[1024];
     int pos = 16;
 
-    write_cstring(pdu, &pos, SYSTEM_ID);
-    write_cstring(pdu, &pos, PASSWORD);
-    write_cstring(pdu, &pos, SYSTEM_TYPE);
+    write_cstring(pdu, &pos, config.smpp_system_id);
+    write_cstring(pdu, &pos, config.smpp_password);
+    write_cstring(pdu, &pos, config.smpp_system_type);
 
     pdu[pos++] = 0x34;
     pdu[pos++] = 0;
     pdu[pos++] = 0;
     pdu[pos++] = 0;
 
-    uint32_t len = pos;
-    uint32_t seqno = next_seq();
+    uint32_t seq = next_seq(w);
 
-    *(uint32_t*)(pdu) = htonl(len);
-    *(uint32_t*)(pdu + 4) = htonl(0x00000009);
-    *(uint32_t*)(pdu + 8) = 0;
-    *(uint32_t*)(pdu + 12) = htonl(seqno);
+    write_u32(pdu, 0, pos);
+    write_u32(pdu, 4, 0x00000009);
+    write_u32(pdu, 8, 0);
+    write_u32(pdu, 12, seq);
 
-    send_pdu(pdu, len);
+    write(w->socket, pdu, pos);
 
-    printf("bind_transceiver sent\n");
+    printf("[SMPP] Worker %d bind_transceiver seq=%u\n", w->id, seq);
 }
 
-uint32_t smpp_submit(const char* from, const char* to, const char* msg,
-                     const char* txid) {
+/* ------------------------------------------------ */
+
+uint32_t smpp_submit(SmppWorker* w, const char* from, const char* to,
+                     const char* msg, const char* txid) {
     uint8_t pdu[1024];
     int pos = 16;
 
@@ -89,16 +222,16 @@ uint32_t smpp_submit(const char* from, const char* to, const char* msg,
 
     pdu[pos++] = 1;
     pdu[pos++] = 1;
-
     write_cstring(pdu, &pos, from);
 
     pdu[pos++] = 1;
     pdu[pos++] = 1;
-
     write_cstring(pdu, &pos, to);
 
     pdu[pos++] = 0;
     pdu[pos++] = 0;
+    pdu[pos++] = 0;
+
     pdu[pos++] = 0;
     pdu[pos++] = 0;
 
@@ -109,171 +242,257 @@ uint32_t smpp_submit(const char* from, const char* to, const char* msg,
     pdu[pos++] = 0;
 
     int len = strlen(msg);
+    if (len > 254) len = 254;
 
     pdu[pos++] = len;
+
     memcpy(pdu + pos, msg, len);
     pos += len;
 
-    uint32_t seqno = next_seq();
+    uint32_t seq = next_seq(w);
 
-    *(uint32_t*)(pdu) = htonl(pos);
-    *(uint32_t*)(pdu + 4) = htonl(0x00000004);
-    *(uint32_t*)(pdu + 8) = 0;
-    *(uint32_t*)(pdu + 12) = htonl(seqno);
+    write_u32(pdu, 0, pos);
+    write_u32(pdu, 4, 0x00000004);
+    write_u32(pdu, 8, 0);
+    write_u32(pdu, 12, seq);
 
-    /* store mapping */
+    int idx = seq % MAX_SEQ;
 
-    strncpy(seq_map[seqno % MAX_SEQ].txid, txid, sizeof(seq_map[0].txid) - 1);
-    strncpy(seq_map[seqno % MAX_SEQ].text, msg, sizeof(seq_map[0].text) - 1);
+    pthread_mutex_lock(&w->lock);
 
-    send_pdu(pdu, pos);
+    snprintf(w->seq_map[idx].txid, sizeof(w->seq_map[idx].txid), "%s", txid);
+    snprintf(w->seq_map[idx].text, sizeof(w->seq_map[idx].text), "%s", msg);
 
-    /*printf("submit_sm sent seq=%u tx=%s\n", seqno, txid);*/
+    pthread_mutex_unlock(&w->lock);
 
-    return seqno;
+    write(w->socket, pdu, pos);
+
+    return seq;
 }
 
-void on_sms(natsConnection* nc, natsSubscription* sub, natsMsg* msg,
-            void* closure) {
-    /*printf("Received: %.*s\n", natsMsg_GetDataLength(msg),*/
-    /*natsMsg_GetData(msg));*/
+/* ------------------------------------------------ */
 
-    char txid[64] = {0};
-    char sender[32] = {0};
-    char dest[32] = {0};
-    char text[512] = {0};
+void* smpp_read_loop(void* arg) {
+    SmppWorker* w = (SmppWorker*)arg;
 
-    sscanf(natsMsg_GetData(msg),
-           "{\"transaction_id\":\"%63[^\"]\",\"sender\":\"%31[^\"]\","
-           "\"destination\":\"%31[^\"]\",\"message\":\"%511[^\"]\"}",
-           txid, sender, dest, text);
-
-    smpp_submit(sender, dest, text, txid);
-
-    natsMsg_Destroy(msg);
-}
-
-void smpp_read_loop(natsConnection* nc) {
     uint8_t header[16];
+    uint8_t body[MAX_BODY];
 
     while (1) {
-        int r = read(smpp_socket, header, 16);
-        if (r <= 0) break;
+        if (read_full(w->socket, header, 16) <= 0) break;
 
-        uint32_t len = ntohl(*(uint32_t*)(header));
-        uint32_t cmd = ntohl(*(uint32_t*)(header + 4));
-        uint32_t seqno = ntohl(*(uint32_t*)(header + 12));
+        uint32_t len, cmd, status, seq;
 
-        uint8_t body[4096];
-        read(smpp_socket, body, len - 16);
+        read_u32(header, 0, &len);
+        read_u32(header, 4, &cmd);
+        read_u32(header, 8, &status);
+        read_u32(header, 12, &seq);
 
-        /* submit_sm_resp */
+        if (len < 16 || len > MAX_BODY) {
+            printf("[SMPP] invalid packet length %u\n", len);
+            break;
+        }
 
-        if (cmd == 0x80000004) {
-            char message_id[64];
+        if (read_full(w->socket, body, len - 16) <= 0) break;
 
-            strncpy(message_id, (char*)body, sizeof(message_id) - 1);
-            message_id[sizeof(message_id) - 1] = 0;
+        if (cmd == 0x80000009) {
+            if (status == 0)
+                printf("[SMPP] Worker %d bind successful\n", w->id);
+        }
 
-            char* txid = seq_map[seqno % MAX_SEQ].txid;
-            char* text = seq_map[seqno % MAX_SEQ].text;
+        else if (cmd == 0x80000004) {
+            char message_id[64] = {0};
 
-            /*printf("submit_sm_resp seq=%u msgid=%s tx=%s\n", seqno,
-             * message_id,*/
-            /*txid);*/
+            size_t mid_len = strnlen((char*)body, len - 16);
+            if (mid_len > sizeof(message_id) - 1)
+                mid_len = sizeof(message_id) - 1;
 
-            char json[1024];
+            memcpy(message_id, body, mid_len);
+
+            int idx = seq % MAX_SEQ;
+
+            char txid[64];
+            char text[512];
+
+            pthread_mutex_lock(&w->lock);
+
+            snprintf(txid, sizeof(txid), "%s", w->seq_map[idx].txid);
+            snprintf(text, sizeof(text), "%s", w->seq_map[idx].text);
+
+            /* clear mapping */
+            w->seq_map[idx].txid[0] = 0;
+            w->seq_map[idx].text[0] = 0;
+
+            pthread_mutex_unlock(&w->lock);
+
+            char json[512];
 
             snprintf(json, sizeof(json),
                      "{\"message_id\":\"%s\",\"transaction_id\":\"%s\","
                      "\"message\":\"%s\"}",
                      message_id, txid, text);
 
-            natsConnection_Publish(nc, "sms.submit", json, strlen(json));
+            publish_event(nc, config.nats_subject_submit, json);
         }
 
-        /* deliver_sm */
+        else if (cmd == 0x00000005) {
+            char message_id[64] = {0};
 
-        if (cmd == 0x00000005) {
             int pos = 0;
 
+            /* skip service_type */
             pos += strlen((char*)body + pos) + 1;
 
-            pos += 1;
-            pos += 1;
+            /* source addr */
+            pos += 2;
             pos += strlen((char*)body + pos) + 1;
 
-            pos += 1;
-            pos += 1;
+            /* dest addr */
+            pos += 2;
             pos += strlen((char*)body + pos) + 1;
 
-            pos += 1;
-            pos += 1;
-            pos += 1;
+            /* skip fixed fields */
+            pos += 1; /* esm_class */
+            pos += 1; /* protocol_id */
+            pos += 1; /* priority */
 
-            pos += strlen((char*)body + pos) + 1;
-            pos += strlen((char*)body + pos) + 1;
+            pos += strlen((char*)body + pos) + 1; /* schedule_delivery */
+            pos += strlen((char*)body + pos) + 1; /* validity_period */
 
-            pos += 1;
-            pos += 1;
-            pos += 1;
-            pos += 1;
+            pos += 1; /* registered_delivery */
+            pos += 1; /* replace_if_present */
+            pos += 1; /* data_coding */
+            pos += 1; /* sm_default_msg_id */
 
-            int sm_length = body[pos++];
+            int sm_len = body[pos++];
+            char* text = (char*)body + pos;
 
-            char dlr_text[512] = {0};
-            memcpy(dlr_text, body + pos, sm_length);
-            dlr_text[sm_length] = 0;
+            /* parse id: from receipt text */
 
-            /*printf("DLR TEXT: %s\n", dlr_text);*/
+            char* id = strstr(text, "id:");
 
-            char message_id[64] = {0};
-            char status[32] = {0};
+            if (id) {
+                id += 3;
 
-            char* p;
+                char* end = strchr(id, ' ');
 
-            p = strstr(dlr_text, "id:");
-            if (p) sscanf(p + 3, "%63s", message_id);
+                if (end) {
+                    int l = end - id;
+                    if (l > 63) l = 63;
 
-            p = strstr(dlr_text, "stat:");
-            if (p) sscanf(p + 5, "%31s", status);
+                    memcpy(message_id, id, l);
+                    message_id[l] = 0;
+                }
+            }
 
             char json[256];
 
             snprintf(json, sizeof(json),
-                     "{\"message_id\":\"%s\",\"status\":\"%s\"}", message_id,
-                     status);
+                     "{\"message_id\":\"%s\",\"status\":\"DELIVRD\"}",
+                     message_id);
 
-            natsConnection_Publish(nc, "sms.delivery", json, strlen(json));
+            publish_event(nc, config.nats_subject_delivery, json);
         }
     }
+
+    printf("[SMPP] Worker %d socket closed\n", w->id);
+
+    return NULL;
 }
 
+/* ------------------------------------------------ */
+
 int main() {
-    natsConnection* nc = NULL;
-    natsSubscription* sub = NULL;
+    if (load_config("config/gateway.conf") != 0) return 1;
+
+    global_tps = config.tps;
+
+    if (global_tps > 0) {
+        send_interval_us = 1000000 / global_tps;
+    }
+
+    worker_count = config.smpp_workers;
+
+    if (worker_count > MAX_WORKERS) worker_count = MAX_WORKERS;
+
     natsStatus s;
 
-    smpp_connect();
-    smpp_bind();
-
-    s = natsConnection_ConnectTo(&nc, "nats://localhost:4222");
+    s = natsConnection_ConnectTo(&nc, config.nats_url);
 
     if (s != NATS_OK) {
-        printf("NATS connection failed\n");
+        printf("[NATS] connection failed\n");
         return 1;
     }
 
-    s = natsConnection_Subscribe(&sub, nc, "sms.outgoing", on_sms, NULL);
+    printf("[NATS] connected\n");
 
-    if (s != NATS_OK) {
-        printf("Subscribe failed\n");
-        return 1;
+    for (int i = 0; i < worker_count; i++) {
+        workers[i].id = i;
+        workers[i].seq = 0;
+
+        pthread_mutex_init(&workers[i].lock, NULL);
+
+        if (smpp_connect(&workers[i]) != 0) return 1;
+
+        smpp_bind(&workers[i]);
+
+        pthread_create(&workers[i].thread, NULL, smpp_read_loop, &workers[i]);
     }
 
-    printf("Consumer running\n");
+    jsCtx* js = NULL;
+    jsOptions opts;
 
-    smpp_read_loop(nc);
+    jsOptions_Init(&opts);
+
+    natsConnection_JetStream(&js, nc, &opts);
+
+    jsSubOptions subOpts;
+    jsSubOptions_Init(&subOpts);
+
+    subOpts.Stream = config.nats_stream_name;
+
+    jsErrCode jerr;
+
+    natsSubscription* sub = NULL;
+
+    js_PullSubscribe(&sub, js, config.nats_subject_outgoing,
+                     config.nats_consumer_smpp, NULL, &subOpts, &jerr);
+
+    printf("[NATS] consumer ready\n");
+
+    while (1) {
+        natsMsgList msgs;
+
+        natsStatus fs =
+            natsSubscription_Fetch(&msgs, sub, BATCH_SIZE, WAIT_TIMEOUT, &jerr);
+
+        if (fs != NATS_OK) continue;
+
+        for (int i = 0; i < msgs.Count; i++) {
+            const char* payload = natsMsg_GetData(msgs.Msgs[i]);
+
+            char txid[64] = {0};
+            char sender[32] = {0};
+            char dest[32] = {0};
+            char text[512] = {0};
+
+            extract_json(payload, "transaction_id", txid, sizeof(txid));
+            extract_json(payload, "sender", sender, sizeof(sender));
+            extract_json(payload, "destination", dest, sizeof(dest));
+            extract_json(payload, "message", text, sizeof(text));
+
+            SmppWorker* w = &workers[rr++ % worker_count];
+
+            global_tps_wait();
+            smpp_submit(w, sender, dest, text, txid);
+
+            natsMsg_Ack(msgs.Msgs[i], NULL);
+            // ✅ Remove natsMsg_Destroy(msgs.Msgs[i]) — natsMsgList_Destroy
+            // handles this
+        }
+
+        natsMsgList_Destroy(&msgs);  // ✅ Single cleanup point
+    }
 
     return 0;
 }

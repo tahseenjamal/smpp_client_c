@@ -1,3 +1,4 @@
+#include <curl/curl.h>
 #include <hiredis/hiredis.h>
 #include <nats/nats.h>
 #include <stdio.h>
@@ -7,21 +8,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_BATCH 200
+#include "../common/config.h"
+
+#define BATCH_SIZE 100
+#define WAIT_TIMEOUT 1000
+#define MAX_MSG 2048
 
 FILE* submit_log;
 FILE* delivery_log;
-
-char submit_buffer[MAX_BATCH][1024];
-char delivery_buffer[MAX_BATCH][1024];
-
-int submit_count = 0;
-int delivery_count = 0;
-
 redisContext* redis;
 
-/* ------------------------------------------------ */
-/* timestamp helper */
 /* ------------------------------------------------ */
 
 void now(char* buf, int size) {
@@ -31,101 +27,93 @@ void now(char* buf, int size) {
 }
 
 /* ------------------------------------------------ */
-/* flush logs */
-/* ------------------------------------------------ */
 
-void flush_submit() {
-    if (submit_count == 0) return;
+void extract_json(const char* json, const char* key, char* out, int max) {
+    char pattern[64];
 
-    for (int i = 0; i < submit_count; i++)
-        fprintf(submit_log, "%s", submit_buffer[i]);
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
 
-    fflush(submit_log);
-    submit_count = 0;
-}
+    char* p = strstr(json, pattern);
+    if (!p) return;
 
-void flush_delivery() {
-    if (delivery_count == 0) return;
+    p += strlen(pattern);
 
-    for (int i = 0; i < delivery_count; i++)
-        fprintf(delivery_log, "%s", delivery_buffer[i]);
+    char* end = strchr(p, '"');
+    if (!end) return;
 
-    fflush(delivery_log);
-    delivery_count = 0;
-}
+    int len = end - p;
 
-/* ------------------------------------------------ */
-/* redis helpers */
-/* ------------------------------------------------ */
+    if (len >= max) len = max - 1;
 
-void store_mapping(const char* msgid, const char* txid) {
-    redisReply* reply =
-        redisCommand(redis, "SETEX sms:%s 86400 %s", msgid, txid);
-    if (reply) freeReplyObject(reply);
-}
-
-char* lookup_mapping(const char* msgid) {
-    redisReply* reply = redisCommand(redis, "GET sms:%s", msgid);
-
-    char* res = NULL;
-
-    if (reply && reply->type == REDIS_REPLY_STRING) res = strdup(reply->str);
-
-    if (reply) freeReplyObject(reply);
-
-    return res;
+    memcpy(out, p, len);
+    out[len] = 0;
 }
 
 /* ------------------------------------------------ */
-/* submit handler */
+
+void send_dlr_callback(const char* txid, const char* message_id,
+                       const char* status) {
+    if (strlen(config.dlr_callback) == 0) return;
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return;
+
+    char json[512];
+
+    snprintf(
+        json, sizeof(json),
+        "{\"transaction_id\":\"%s\",\"message_id\":\"%s\",\"status\":\"%s\"}",
+        txid, message_id, status);
+
+    struct curl_slist* headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, config.dlr_callback);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000L);
+
+    curl_easy_perform(curl);
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+}
+
 /* ------------------------------------------------ */
 
-void on_submit(natsConnection* nc, natsSubscription* sub, natsMsg* msg,
-               void* c) {
+void process_submit(const char* payload) {
     char message_id[64] = {0};
     char txid[64] = {0};
-    char text[512] = {0};
+    char message[512] = {0};
 
-    sscanf(natsMsg_GetData(msg),
-           "{\"message_id\":\"%63[^\"]\",\"transaction_id\":\"%63[^\"]\","
-           "\"message\":\"%511[^\"]\"}",
-           message_id, txid, text);
+    extract_json(payload, "message_id", message_id, sizeof(message_id));
+    extract_json(payload, "transaction_id", txid, sizeof(txid));
+    extract_json(payload, "message", message, sizeof(message));
 
     char ts[64];
     now(ts, sizeof(ts));
 
-    /* store mapping */
-
     redisReply* r =
         redisCommand(redis, "SETEX sms:%s 86400 %s", message_id, txid);
+
     if (r) freeReplyObject(r);
 
-    /* write log */
-
-    fprintf(submit_log, "%s|%s|%s|SUBMITTED|%s\n", ts, message_id, txid, text);
-    fflush(submit_log);
-
-    /*printf("SUBMIT %s %s\n", message_id, txid);*/
-
-    natsMsg_Destroy(msg);
+    fprintf(submit_log, "%s|%s|%s|SUBMITTED|%s\n", ts, message_id, txid,
+            message);
 }
 
 /* ------------------------------------------------ */
-/* delivery handler */
-/* ------------------------------------------------ */
 
-void on_delivery(natsConnection* nc, natsSubscription* sub, natsMsg* msg,
-                 void* c) {
+void process_delivery(const char* payload) {
     char message_id[64] = {0};
     char status[32] = {0};
 
-    sscanf(natsMsg_GetData(msg),
-           "{\"message_id\":\"%63[^\"]\",\"status\":\"%31[^\"]\"}", message_id,
-           status);
-
-    char* txid = NULL;
+    extract_json(payload, "message_id", message_id, sizeof(message_id));
+    extract_json(payload, "status", status, sizeof(status));
 
     redisReply* r = redisCommand(redis, "GET sms:%s", message_id);
+
+    char* txid = NULL;
 
     if (r && r->type == REDIS_REPLY_STRING) txid = r->str;
 
@@ -135,87 +123,141 @@ void on_delivery(natsConnection* nc, natsSubscription* sub, natsMsg* msg,
     fprintf(delivery_log, "%s|%s|%s|%s\n", ts, message_id,
             txid ? txid : "UNKNOWN", status);
 
-    fflush(delivery_log);
+    if (txid) send_dlr_callback(txid, message_id, status);
 
     if (r) freeReplyObject(r);
-
-    /*printf("DLR %s %s\n", message_id, status);*/
-
-    natsMsg_Destroy(msg);
 }
 
-/* ------------------------------------------------ */
-/* main */
 /* ------------------------------------------------ */
 
 int main() {
     printf("Starting logger\n");
 
-    mkdir("logs", 0755);
+    if (load_config("config/gateway.conf") != 0) return 1;
 
-    submit_log = fopen("logs/submit.log", "a");
-    delivery_log = fopen("logs/delivery.log", "a");
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    mkdir(config.log_dir, 0755);
+
+    char submit_path[256];
+    char delivery_path[256];
+
+    snprintf(submit_path, sizeof(submit_path), "%s/submit.log", config.log_dir);
+
+    snprintf(delivery_path, sizeof(delivery_path), "%s/delivery.log",
+             config.log_dir);
+
+    submit_log = fopen(submit_path, "a");
+    delivery_log = fopen(delivery_path, "a");
 
     if (!submit_log || !delivery_log) {
         perror("log open failed");
-        exit(1);
+        return 1;
     }
 
-    /* Redis */
-
-    redis = redisConnect("127.0.0.1", 6379);
+    redis = redisConnect(config.redis_host, config.redis_port);
 
     if (!redis || redis->err) {
         printf("Redis connection failed\n");
-        exit(1);
+        return 1;
     }
 
     printf("Connected to Redis\n");
 
-    /* NATS */
+    /* ---------------- NATS ---------------- */
 
-    natsConnection* nc;
-    natsSubscription* sub_submit;
-    natsSubscription* sub_delivery;
+    natsConnection* nc = NULL;
+    jsCtx* js = NULL;
 
-    natsStatus s;
-
-    s = natsConnection_ConnectTo(&nc, "nats://localhost:4222");
-
-    if (s != NATS_OK) {
-        printf("NATS connection failed: %s\n", natsStatus_GetText(s));
-        exit(1);
+    if (natsConnection_ConnectTo(&nc, config.nats_url) != NATS_OK) {
+        printf("NATS connect failed\n");
+        return 1;
     }
 
-    printf("Connected to NATS\n");
+    jsOptions jsOpts;
+    jsOptions_Init(&jsOpts);
 
-    /* subscribe */
+    natsConnection_JetStream(&js, nc, &jsOpts);
 
-    s = natsConnection_Subscribe(&sub_submit, nc, "sms.submit", on_submit,
-                                 NULL);
+    printf("JetStream ready\n");
 
-    if (s != NATS_OK) {
-        printf("Subscribe submit failed\n");
-        exit(1);
-    }
+    /* ---------------- JetStream Pull ---------------- */
 
-    s = natsConnection_Subscribe(&sub_delivery, nc, "sms.delivery", on_delivery,
-                                 NULL);
+    jsSubOptions subOpts;
+    jsSubOptions_Init(&subOpts);
 
-    if (s != NATS_OK) {
-        printf("Subscribe delivery failed\n");
-        exit(1);
-    }
+    /* READ STREAM FROM CONFIG */
+    subOpts.Stream = config.nats_stream_name;
 
-    printf("Logger running\n");
+    jsErrCode jerr;
+
+    natsSubscription* sub_submit = NULL;
+    natsSubscription* sub_delivery = NULL;
+
+    js_PullSubscribe(&sub_submit, js, config.nats_subject_submit,
+                     "logger_submit", NULL, &subOpts, &jerr);
+
+    js_PullSubscribe(&sub_delivery, js, config.nats_subject_delivery,
+                     "logger_delivery", NULL, &subOpts, &jerr);
+
+    printf("Logger pull subscribers running\n");
+
+    /* ---------------- Main Loop ---------------- */
 
     while (1) {
-        /* periodic flush */
+        natsMsgList msgs;
+        memset(&msgs, 0, sizeof(msgs));
 
-        flush_submit();
-        flush_delivery();
+        natsStatus s = natsSubscription_Fetch(&msgs, sub_submit, BATCH_SIZE,
+                                              WAIT_TIMEOUT, &jerr);
 
-        usleep(200000);
+        if (s == NATS_OK) {
+            for (int i = 0; i < msgs.Count; i++) {
+                const char* data = natsMsg_GetData(msgs.Msgs[i]);
+
+                char safe[MAX_MSG];
+
+                int len = natsMsg_GetDataLength(msgs.Msgs[i]);
+                if (len >= MAX_MSG) len = MAX_MSG - 1;
+
+                memcpy(safe, data, len);
+                safe[len] = 0;
+
+                process_submit(safe);
+
+                natsMsg_Ack(msgs.Msgs[i], NULL);
+            }
+
+            natsMsgList_Destroy(&msgs);
+        }
+
+        memset(&msgs, 0, sizeof(msgs));
+
+        s = natsSubscription_Fetch(&msgs, sub_delivery, BATCH_SIZE,
+                                   WAIT_TIMEOUT, &jerr);
+
+        if (s == NATS_OK) {
+            for (int i = 0; i < msgs.Count; i++) {
+                const char* data = natsMsg_GetData(msgs.Msgs[i]);
+
+                char safe[MAX_MSG];
+
+                int len = natsMsg_GetDataLength(msgs.Msgs[i]);
+                if (len >= MAX_MSG) len = MAX_MSG - 1;
+
+                memcpy(safe, data, len);
+                safe[len] = 0;
+
+                process_delivery(safe);
+
+                natsMsg_Ack(msgs.Msgs[i], NULL);
+            }
+
+            natsMsgList_Destroy(&msgs);
+        }
+
+        fflush(submit_log);
+        fflush(delivery_log);
     }
 
     return 0;

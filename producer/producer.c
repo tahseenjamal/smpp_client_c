@@ -4,15 +4,75 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define PORT 8080
+#include "../common/config.h"
+
 #define MAX_BODY 4096
 
 natsConnection* nc;
+jsCtx* js;
 
 typedef struct {
     char body[MAX_BODY];
     size_t size;
 } RequestContext;
+
+/* ------------------------------------------------ */
+/* Ensure JetStream stream exists                   */
+/* ------------------------------------------------ */
+
+static int ensure_stream() {
+    jsStreamInfo* si = NULL;
+    jsErrCode jerr = 0;
+
+    /* try lookup first */
+
+    natsStatus s =
+        js_GetStreamInfo(&si, js, config.nats_stream_name, NULL, &jerr);
+
+    if (s == NATS_OK) {
+        printf("[JetStream] Stream already exists: %s\n",
+               config.nats_stream_name);
+        jsStreamInfo_Destroy(si);
+        return 0;
+    }
+
+    printf("[JetStream] Creating stream: %s\n", config.nats_stream_name);
+
+    jsStreamConfig sc;
+    jsStreamConfig_Init(&sc);
+
+    sc.Name = config.nats_stream_name;
+
+    const char* subjects[1];
+    subjects[0] = config.nats_subject_outgoing;
+
+    sc.Subjects = subjects;
+    sc.SubjectsLen = 1;
+
+    sc.Storage = 1; /* file storage */
+    sc.MaxMsgs = -1;
+    sc.MaxBytes = -1;
+    sc.MaxAge = 0;
+
+    s = js_AddStream(&si, js, &sc, NULL, &jerr);
+
+    if (s != NATS_OK) {
+        printf("[JetStream] Stream creation failed\n");
+        printf("NATS status: %s\n", natsStatus_GetText(s));
+        printf("JS error code: %d\n", jerr);
+        return -1;
+    }
+
+    printf("[JetStream] Stream created successfully\n");
+
+    if (si) jsStreamInfo_Destroy(si);
+
+    return 0;
+}
+
+/* ------------------------------------------------ */
+/* HTTP handler                                     */
+/* ------------------------------------------------ */
 
 static enum MHD_Result handler(void* cls, struct MHD_Connection* connection,
                                const char* url, const char* method,
@@ -22,16 +82,18 @@ static enum MHD_Result handler(void* cls, struct MHD_Connection* connection,
 
     if (strcmp(method, "POST") != 0) return MHD_NO;
 
-    if (strcmp(url, "/send_sms") != 0) return MHD_NO;
+    if (strcmp(url, config.producer_route) != 0) return MHD_NO;
 
-    /* First call: allocate context */
+    /* first call */
+
     if (ctx == NULL) {
         ctx = calloc(1, sizeof(RequestContext));
         *con_cls = ctx;
         return MHD_YES;
     }
 
-    /* Receive POST body chunks */
+    /* receive POST body */
+
     if (*upload_data_size != 0) {
         if (ctx->size + *upload_data_size < MAX_BODY) {
             memcpy(ctx->body + ctx->size, upload_data, *upload_data_size);
@@ -42,18 +104,21 @@ static enum MHD_Result handler(void* cls, struct MHD_Connection* connection,
         return MHD_YES;
     }
 
-    /* Body fully received → publish to NATS */
+    /* ------------------------------------------------ */
+    /* publish to JetStream                             */
+    /* ------------------------------------------------ */
 
-    /*printf("Publishing: %.*s\n", (int)ctx->size, ctx->body);*/
+    jsPubAck* pa = NULL;
+    jsErrCode jerr;
 
-    natsStatus s =
-        natsConnection_Publish(nc, "sms.outgoing", ctx->body, ctx->size);
+    natsStatus s = js_Publish(&pa, js, config.nats_subject_outgoing, ctx->body,
+                              ctx->size, NULL, &jerr);
 
     if (s != NATS_OK) {
-        printf("Publish failed: %s\n", natsStatus_GetText(s));
-    } else {
-        printf("Publish OK\n");
+        printf("[JetStream] publish failed: %s\n", natsStatus_GetText(s));
     }
+
+    if (pa != NULL) jsPubAck_Destroy(pa);
 
     free(ctx);
     *con_cls = NULL;
@@ -70,33 +135,69 @@ static enum MHD_Result handler(void* cls, struct MHD_Connection* connection,
     return ret;
 }
 
+/* ------------------------------------------------ */
+/* main                                             */
+/* ------------------------------------------------ */
+
 int main() {
+    if (load_config("config/gateway.conf") != 0) {
+        printf("Config load failed\n");
+        return 1;
+    }
+
     natsStatus s;
 
-    s = natsConnection_ConnectTo(&nc, "nats://localhost:4222");
+    /* connect to NATS */
+
+    s = natsConnection_ConnectTo(&nc, config.nats_url);
 
     if (s != NATS_OK) {
         printf("NATS connect failed: %s\n", natsStatus_GetText(s));
         exit(1);
     }
 
-    printf("Connected to NATS\n");
+    printf("[NATS] connected %s\n", config.nats_url);
+
+    /* create JetStream context */
+
+    jsOptions opts;
+    jsOptions_Init(&opts);
+
+    s = natsConnection_JetStream(&js, nc, &opts);
+
+    if (s != NATS_OK) {
+        printf("JetStream init failed: %s\n", natsStatus_GetText(s));
+        exit(1);
+    }
+
+    printf("[JetStream] ready\n");
+
+    /* auto create stream */
+
+    if (ensure_stream() != 0) {
+        printf("Stream initialization failed\n");
+        exit(1);
+    }
+
+    /* start HTTP server */
 
     struct MHD_Daemon* daemon =
-        MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, PORT, NULL, NULL, &handler,
-                         NULL, MHD_OPTION_END);
+        MHD_start_daemon(MHD_USE_SELECT_INTERNALLY, config.producer_port, NULL,
+                         NULL, &handler, NULL, MHD_OPTION_END);
 
     if (!daemon) {
         printf("Failed to start HTTP server\n");
         exit(1);
     }
 
-    printf("Producer listening on %d\n", PORT);
+    printf("Producer listening on port %d route %s\n", config.producer_port,
+           config.producer_route);
 
     getchar();
 
     MHD_stop_daemon(daemon);
 
+    jsCtx_Destroy(js);
     natsConnection_Destroy(nc);
 
     return 0;
