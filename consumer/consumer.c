@@ -460,10 +460,6 @@ int main() {
 
         pthread_mutex_init(&workers[i].lock, NULL);
 
-        if (smpp_connect(&workers[i]) != 0) return 1;
-
-        smpp_bind(&workers[i]);
-
         pthread_create(&workers[i].thread, NULL, smpp_worker_loop, &workers[i]);
     }
 
