@@ -177,7 +177,10 @@ int main() {
     jsOptions jsOpts;
     jsOptions_Init(&jsOpts);
 
-    natsConnection_JetStream(&js, nc, &jsOpts);
+    if (natsConnection_JetStream(&js, nc, &jsOpts) != NATS_OK) {
+        printf("JetStream init failed\n");
+        return 1;
+    }
 
     printf("JetStream ready\n");
 
@@ -194,11 +197,23 @@ int main() {
     natsSubscription* sub_submit = NULL;
     natsSubscription* sub_delivery = NULL;
 
-    js_PullSubscribe(&sub_submit, js, config.nats_subject_submit,
-                     "logger_submit", NULL, &subOpts, &jerr);
+    natsStatus ps;
 
-    js_PullSubscribe(&sub_delivery, js, config.nats_subject_delivery,
-                     "logger_delivery", NULL, &subOpts, &jerr);
+    ps = js_PullSubscribe(&sub_submit, js, config.nats_subject_submit,
+                          "logger_submit", NULL, &subOpts, &jerr);
+    if (ps != NATS_OK || sub_submit == NULL) {
+        printf("PullSubscribe submit failed: %s (js err %d)\n",
+               natsStatus_GetText(ps), jerr);
+        return 1;
+    }
+
+    ps = js_PullSubscribe(&sub_delivery, js, config.nats_subject_delivery,
+                          "logger_delivery", NULL, &subOpts, &jerr);
+    if (ps != NATS_OK || sub_delivery == NULL) {
+        printf("PullSubscribe delivery failed: %s (js err %d)\n",
+               natsStatus_GetText(ps), jerr);
+        return 1;
+    }
 
     printf("Logger pull subscribers running\n");
 

@@ -1,10 +1,15 @@
 #include <microhttpd.h>
 #include <nats/nats.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "../common/config.h"
+
+static volatile sig_atomic_t running = 1;
+static void on_signal(int sig) { (void)sig; running = 0; }
 
 #define MAX_BODY 4096
 
@@ -14,6 +19,7 @@ jsCtx* js;
 typedef struct {
     char body[MAX_BODY];
     size_t size;
+    int overflow;
 } RequestContext;
 
 /* ------------------------------------------------ */
@@ -98,10 +104,22 @@ static enum MHD_Result handler(void* cls, struct MHD_Connection* connection,
         if (ctx->size + *upload_data_size < MAX_BODY) {
             memcpy(ctx->body + ctx->size, upload_data, *upload_data_size);
             ctx->size += *upload_data_size;
+        } else {
+            ctx->overflow = 1;
         }
-
         *upload_data_size = 0;
         return MHD_YES;
+    }
+
+    if (ctx->overflow) {
+        free(ctx);
+        *con_cls = NULL;
+        const char* msg = "payload too large";
+        struct MHD_Response* res = MHD_create_response_from_buffer(
+            strlen(msg), (void*)msg, MHD_RESPMEM_PERSISTENT);
+        enum MHD_Result ret = MHD_queue_response(connection, 413, res);
+        MHD_destroy_response(res);
+        return ret;
     }
 
     /* ------------------------------------------------ */
@@ -193,7 +211,10 @@ int main() {
     printf("Producer listening on port %d route %s\n", config.producer_port,
            config.producer_route);
 
-    getchar();
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+
+    while (running) pause();
 
     MHD_stop_daemon(daemon);
 

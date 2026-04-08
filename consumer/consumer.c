@@ -39,7 +39,8 @@ typedef struct {
     int socket;
     pthread_t thread;
 
-    pthread_mutex_t lock;
+    pthread_mutex_t lock;        /* protects seq_map */
+    pthread_mutex_t socket_lock; /* protects socket fd during reconnect */
 
     SeqMap seq_map[MAX_SEQ];
     uint32_t seq;
@@ -163,9 +164,9 @@ void write_cstring(uint8_t* buf, int* pos, const char* str) {
 int smpp_connect(SmppWorker* w) {
     struct sockaddr_in addr;
 
-    w->socket = socket(AF_INET, SOCK_STREAM, 0);
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
 
-    if (w->socket < 0) {
+    if (sock < 0) {
         perror("socket");
         return -1;
     }
@@ -174,10 +175,15 @@ int smpp_connect(SmppWorker* w) {
     addr.sin_port = htons(config.smpp_port);
     addr.sin_addr.s_addr = inet_addr(config.smpp_host);
 
-    if (connect(w->socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("SMPP connect");
+        close(sock);
         return -1;
     }
+
+    pthread_mutex_lock(&w->socket_lock);
+    w->socket = sock;
+    pthread_mutex_unlock(&w->socket_lock);
 
     printf("[SMPP] Worker %d connected\n", w->id);
 
@@ -206,7 +212,7 @@ void smpp_bind(SmppWorker* w) {
     write_u32(pdu, 8, 0);
     write_u32(pdu, 12, seq);
 
-    write(w->socket, pdu, pos);
+    if (write(w->socket, pdu, pos) < 0) perror("[SMPP] bind write");
 
     printf("[SMPP] Worker %d bind_transceiver seq=%u\n", w->id, seq);
 }
@@ -259,13 +265,20 @@ uint32_t smpp_submit(SmppWorker* w, const char* from, const char* to,
     int idx = seq % MAX_SEQ;
 
     pthread_mutex_lock(&w->lock);
-
     snprintf(w->seq_map[idx].txid, sizeof(w->seq_map[idx].txid), "%s", txid);
     snprintf(w->seq_map[idx].text, sizeof(w->seq_map[idx].text), "%s", msg);
-
     pthread_mutex_unlock(&w->lock);
 
-    write(w->socket, pdu, pos);
+    pthread_mutex_lock(&w->socket_lock);
+    int sock = w->socket;
+    pthread_mutex_unlock(&w->socket_lock);
+
+    if (sock < 0) {
+        printf("[SMPP] Worker %d not connected, dropping submit\n", w->id);
+        return 0;
+    }
+
+    if (write(sock, pdu, pos) < 0) perror("[SMPP] submit write");
 
     return seq;
 }
@@ -421,7 +434,10 @@ void* smpp_worker_loop(void* arg) {
 
         printf("[SMPP] Worker %d disconnected\n", w->id);
 
+        pthread_mutex_lock(&w->socket_lock);
         close(w->socket);
+        w->socket = -1;
+        pthread_mutex_unlock(&w->socket_lock);
 
         sleep(3);
     }
@@ -457,8 +473,10 @@ int main() {
     for (int i = 0; i < worker_count; i++) {
         workers[i].id = i;
         workers[i].seq = 0;
+        workers[i].socket = -1;
 
         pthread_mutex_init(&workers[i].lock, NULL);
+        pthread_mutex_init(&workers[i].socket_lock, NULL);
 
         pthread_create(&workers[i].thread, NULL, smpp_worker_loop, &workers[i]);
     }
@@ -468,7 +486,10 @@ int main() {
 
     jsOptions_Init(&opts);
 
-    natsConnection_JetStream(&js, nc, &opts);
+    if (natsConnection_JetStream(&js, nc, &opts) != NATS_OK) {
+        printf("[NATS] JetStream init failed\n");
+        return 1;
+    }
 
     jsSubOptions subOpts;
     jsSubOptions_Init(&subOpts);
@@ -479,8 +500,15 @@ int main() {
 
     natsSubscription* sub = NULL;
 
-    js_PullSubscribe(&sub, js, config.nats_subject_outgoing,
-                     config.nats_consumer_smpp, NULL, &subOpts, &jerr);
+    natsStatus ps = js_PullSubscribe(&sub, js, config.nats_subject_outgoing,
+                                     config.nats_consumer_smpp, NULL, &subOpts,
+                                     &jerr);
+
+    if (ps != NATS_OK || sub == NULL) {
+        printf("[NATS] PullSubscribe failed: %s (js err %d)\n",
+               natsStatus_GetText(ps), jerr);
+        return 1;
+    }
 
     printf("[NATS] consumer ready\n");
 
