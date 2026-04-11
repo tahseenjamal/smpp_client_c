@@ -92,6 +92,17 @@ static void set_value(const char* key, const char* value) {
     else if (strcmp(key, "nats_stream_name") == 0)
         strncpy(config.nats_stream_name, value,
                 sizeof(config.nats_stream_name));
+
+    else if (strcmp(key, "send_window_morning") == 0)
+        strncpy(config.send_window_morning, value,
+                sizeof(config.send_window_morning));
+
+    else if (strcmp(key, "send_window_evening") == 0)
+        strncpy(config.send_window_evening, value,
+                sizeof(config.send_window_evening));
+
+    else if (strcmp(key, "metrics_port") == 0)
+        config.metrics_port = atoi(value);
 }
 
 /* load config file */

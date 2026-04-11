@@ -18,6 +18,18 @@ FILE* submit_log;
 FILE* delivery_log;
 redisContext* redis;
 
+static void ensure_redis() {
+    if (redis && !redis->err) return;
+    if (redis) redisFree(redis);
+    redis = redisConnect(config.redis_host, config.redis_port);
+    if (!redis || redis->err) {
+        printf("[Redis] reconnect failed\n");
+        redis = NULL;
+    } else {
+        printf("[Redis] reconnected\n");
+    }
+}
+
 /* ------------------------------------------------ */
 
 void now(char* buf, int size) {
@@ -93,10 +105,12 @@ void process_submit(const char* payload) {
     char ts[64];
     now(ts, sizeof(ts));
 
-    redisReply* r =
-        redisCommand(redis, "SETEX sms:%s 86400 %s", message_id, txid);
-
-    if (r) freeReplyObject(r);
+    ensure_redis();
+    if (redis) {
+        redisReply* r =
+            redisCommand(redis, "SETEX sms:%s 86400 %s", message_id, txid);
+        if (r) freeReplyObject(r);
+    }
 
     fprintf(submit_log, "%s|%s|%s|SUBMITTED|%s\n", ts, message_id, txid,
             message);
@@ -111,14 +125,16 @@ void process_delivery(const char* payload) {
     extract_json(payload, "message_id", message_id, sizeof(message_id));
     extract_json(payload, "status", status, sizeof(status));
 
-    redisReply* r = redisCommand(redis, "GET sms:%s", message_id);
-
-    char* txid = NULL;
-
-    if (r && r->type == REDIS_REPLY_STRING) txid = r->str;
-
     char ts[64];
     now(ts, sizeof(ts));
+
+    ensure_redis();
+
+    redisReply* r = NULL;
+    if (redis) r = redisCommand(redis, "GET sms:%s", message_id);
+
+    char* txid = NULL;
+    if (r && r->type == REDIS_REPLY_STRING) txid = r->str;
 
     fprintf(delivery_log, "%s|%s|%s|%s\n", ts, message_id,
             txid ? txid : "UNKNOWN", status);

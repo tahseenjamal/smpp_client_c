@@ -31,6 +31,11 @@ typedef struct {
 
     char log_dir[256];
 
+    char send_window_morning[16]; /* "HH:MM" — marketing send window start */
+    char send_window_evening[16]; /* "HH:MM" — marketing send window end   */
+
+    int metrics_port;             /* Prometheus /metrics HTTP port          */
+
 } GatewayConfig;
 
 extern GatewayConfig config;

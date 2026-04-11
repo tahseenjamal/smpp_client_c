@@ -1,487 +1,458 @@
 # C SMPP Messaging Gateway
 
+A carrier-grade **SMS gateway written in C** built around an event-driven pipeline:
 **HTTP → NATS JetStream → SMPP → Redis → Logging → DLR Callback**
 
-A lightweight **high-performance SMS gateway written in C** designed around an **event-driven architecture** using **NATS JetStream** as the message bus.
+---
 
-The system provides:
+## Architecture
 
-* HTTP SMS ingestion
-* asynchronous processing via NATS
-* multi-connection SMPP delivery
-* delivery receipt tracking
-* Redis message mapping
-* structured logs
-* DLR HTTP callbacks
+```mermaid
+flowchart TD
+    Client(["HTTP Client"])
 
-The architecture is suitable for **high-throughput SMS processing pipelines**.
+    subgraph Producer["Producer  (producer/producer.c)"]
+        HTTP["HTTP Server\nPOST /send_sms"]
+        JS_PUB["JetStream Publish\nsms.outgoing"]
+    end
+
+    subgraph NATS["NATS JetStream  —  Stream: SMS"]
+        S_OUT["sms.outgoing"]
+        S_SUB["sms.submit"]
+        S_DLV["sms.delivery"]
+    end
+
+    subgraph Consumer["Consumer  (consumer/consumer.c)"]
+        PULL["Pull Consumer\nbatch fetch"]
+        WIN["Marketing Window\ncheck"]
+        TPS["Global TPS Limiter\nnanosleep scheduler"]
+        RR["Round-Robin\nWorker Select"]
+
+        subgraph Workers["SMPP Workers  (N × smpp_workers)"]
+            W0["Worker 0\nWindowSem"]
+            W1["Worker 1\nWindowSem"]
+            WN["Worker N\nWindowSem"]
+        end
+
+        LONG["Long Message\nEncoder\nGSM-7 / UCS-2\nsplit + UDH"]
+    end
+
+    subgraph SMSC["SMSC  (port 2775)"]
+        SMSC_IN["submit_sm"]
+        SMSC_RESP["submit_sm_resp\n+ message_id"]
+        SMSC_DLR["deliver_sm\nDLR receipt"]
+    end
+
+    subgraph Logger["Logger  (logger/logger.c)"]
+        LSUB["Pull: sms.submit"]
+        LDLV["Pull: sms.delivery"]
+        REDIS["Redis\nsms:msgid → txid\nTTL 86400s"]
+        SLOG["submit.log"]
+        DLOG["delivery.log"]
+        CURL["DLR HTTP Callback\nlibcurl"]
+    end
+
+    METRICS["Prometheus\n/metrics  :9091"]
+
+    Client -->|"POST /send_sms\nJSON payload"| HTTP
+    HTTP --> JS_PUB
+    JS_PUB --> S_OUT
+    S_OUT --> PULL
+    PULL --> WIN
+    WIN -->|"transactional\nor in-window"| TPS
+    WIN -->|"marketing\nout-of-window\nACK + drop"| PULL
+    TPS --> RR
+    RR --> LONG
+    LONG --> W0 & W1 & WN
+    W0 & W1 & WN -->|submit_sm| SMSC_IN
+    SMSC_RESP -->|"wsem_post\n+ RTT metric"| W0 & W1 & WN
+    SMSC_DLR --> W0 & W1 & WN
+    W0 & W1 & WN -->|"sms.submit\nmsg_id + tx_id"| S_SUB
+    W0 & W1 & WN -->|"sms.delivery\nstatus + error"| S_DLV
+    S_SUB --> LSUB
+    S_DLV --> LDLV
+    LSUB --> REDIS
+    LSUB --> SLOG
+    LDLV --> REDIS
+    LDLV --> DLOG
+    LDLV --> CURL
+    Consumer -.->|"counters\nRTT histogram\nsession gauge"| METRICS
+```
 
 ---
 
-# Architecture
+## Message Flow Detail
 
-```
-Client
-  │
-  │ HTTP POST /send_sms
-  ▼
-┌──────────────┐
-│   Producer   │
-│ HTTP Server  │
-└──────┬───────┘
-       │
-       │ sms.outgoing
-       ▼
-┌────────────────┐
-│  NATS STREAM   │
-│      SMS       │
-└──────┬─────────┘
-       │
-       │ Pull consumer
-       ▼
-┌──────────────────┐
-│     Consumer     │
-│   SMPP Workers   │
-└──────┬───────────┘
-       │
-       │ SMPP
-       ▼
-      SMSC
-       │
-       ├─ submit_sm_resp
-       │        │
-       │        ▼
-       │   sms.submit
-       │
-       └─ deliver_sm
-                │
-                ▼
-           sms.delivery
-                │
-                ▼
-           ┌─────────┐
-           │ Logger  │
-           └────┬────┘
-                │
-      ┌─────────┼───────────┐
-      ▼         ▼           ▼
-  submit.log delivery.log  Redis
-                              │
-                              ▼
-                         DLR callback
+```mermaid
+sequenceDiagram
+    participant C  as HTTP Client
+    participant P  as Producer
+    participant N  as NATS JetStream
+    participant W  as Consumer Worker
+    participant S  as SMSC
+    participant L  as Logger
+    participant R  as Redis
+
+    C->>P: POST /send_sms (JSON)
+    P->>N: js_Publish → sms.outgoing
+    N-->>P: PubAck
+
+    W->>N: Fetch batch (sms.outgoing)
+    N-->>W: message batch
+    Note over W: marketing window check
+    Note over W: TPS wait
+    Note over W: wsem_wait (window slot)
+    W->>S: submit_sm (GSM-7 or UCS-2, single or multi-part)
+    S-->>W: submit_sm_resp + message_id
+    Note over W: wsem_post · rtt_observe()
+    W->>N: Publish → sms.submit
+
+    S-->>W: deliver_sm (id: stat: err:)
+    W->>N: Publish → sms.delivery
+
+    L->>N: Fetch sms.submit
+    L->>R: SETEX sms:<msg_id> 86400 <tx_id>
+    L->>L: append submit.log
+
+    L->>N: Fetch sms.delivery
+    L->>R: GET sms:<msg_id>
+    L->>L: append delivery.log
+    L->>C: HTTP POST dlr_callback (JSON)
 ```
 
 ---
 
-# Components
+## Worker Lifecycle
 
-## Producer
-
-Location
-
-```
-producer/producer.c
-```
-
-Responsibilities
-
-* HTTP server
-* Accept SMS requests
-* Publish to JetStream
-
-Endpoint
-
-```
-POST /send_sms
+```mermaid
+stateDiagram-v2
+    [*] --> Connecting
+    Connecting --> Connected : TCP + bind_transceiver OK
+    Connecting --> Backing_off : connect failed
+    Backing_off --> Connecting : sleep(backoff)\nbackoff = min(backoff×2, 60s)
+    Connected --> Reading : bind_transceiver_resp OK\nm_sessions++
+    Reading --> Reading : submit_sm_resp → wsem_post + RTT\ndeliver_sm → parse stat/err
+    Reading --> Disconnected : read error / socket closed
+    Disconnected --> Backing_off : m_sessions--\nwsem_reset\nclose socket
+    Disconnected --> [*] : running == 0
 ```
 
-Example request
+---
+
+## Components
+
+### Producer — `producer/producer.c`
+
+- Starts an HTTP server on `producer_port`
+- Accepts `POST /send_sms` with a JSON body
+- Ensures the JetStream stream `SMS` exists (subjects: `sms.outgoing`, `sms.submit`, `sms.delivery`)
+- Publishes the raw payload to `sms.outgoing`
+
+**Request**
 
 ```json
 {
- "transaction_id":"TX123",
- "sender":"TEST",
- "destination":"1234567890",
- "message":"hello world"
+  "transaction_id": "TX123",
+  "sender":         "MYAPP",
+  "destination":    "447700900000",
+  "message":        "Hello world",
+  "message_type":   "transactional"
 }
 ```
 
-Response
+> `message_type` is optional. Values: `transactional` (default, always sent) or `marketing` (dropped outside the send window).
 
-```
-queued
-```
-
-Producer ensures the JetStream stream exists before publishing.
+**Response:** `queued`
 
 ---
 
-## Consumer
+### Consumer — `consumer/consumer.c`
 
-Location
+Pull-based JetStream consumer that owns all SMPP state.
 
-```
-consumer/consumer.c
-```
+| Feature | Detail |
+|---|---|
+| **SMPP workers** | `smpp_workers` parallel bind_transceiver sessions |
+| **Window control** | Per-worker `WindowSem` caps in-flight PDUs at `smpp_window_size` |
+| **TPS limiter** | Global microsecond scheduler across all workers |
+| **Encoding** | Auto-detects ASCII → GSM-7 or non-ASCII → UCS-2 |
+| **Long messages** | Auto-splits with 6-byte UDH; up to 16 segments |
+| **Reconnect** | Exponential backoff: 1 s → 2 → 4 → … → 60 s |
+| **DLR parsing** | Extracts `id:`, `stat:`, and `err:` from receipt text |
+| **Marketing window** | Drops `marketing` messages outside `send_window_morning`–`send_window_evening` |
+| **Metrics** | Prometheus text endpoint on `metrics_port` |
+| **Shutdown** | `SIGINT`/`SIGTERM` drains workers cleanly via `pthread_join` |
 
-Responsibilities
+**Prometheus metrics exposed**
 
-* Pull messages from NATS
-* Send SMS via SMPP
-* Publish submit and delivery events
-
-Features
-
-* multiple SMPP workers
-* reconnect loop
-* global TPS limiter
-* submit response mapping
-* delivery receipt parsing
-
-Worker lifecycle
-
-```
-worker thread
-    reconnect loop
-        connect
-        bind
-        read SMPP PDUs
-        reconnect on failure
-```
+| Metric | Type | Description |
+|---|---|---|
+| `sms_submitted_total{status="success\|failed"}` | counter | submit_sm PDUs sent |
+| `sms_dlr_received_total` | counter | deliver_sm receipts received |
+| `smpp_sessions_connected` | gauge | active bind_transceiver sessions |
+| `sms_submit_rtt_ms` | histogram | submit_sm round-trip time (ms) |
 
 ---
 
-## Logger
+### Logger — `logger/logger.c`
 
-Location
+Pull-based JetStream consumer on `sms.submit` and `sms.delivery`.
 
-```
-logger/logger.c
-```
-
-Responsibilities
-
-* process submit events
-* process delivery events
-* store message mapping in Redis
-* write logs
-* trigger DLR callbacks
+| Action | Detail |
+|---|---|
+| `sms.submit` | Writes `submit.log`, stores `sms:<msg_id> → tx_id` in Redis (TTL 86400 s) |
+| `sms.delivery` | Looks up `tx_id` from Redis, writes `delivery.log`, fires DLR callback |
+| Redis reconnect | Auto-reconnects on connection drop |
 
 ---
 
-# Logging
+## Log Formats
 
-## Submit Log
-
+**submit.log**
 ```
-timestamp|message_id|transaction_id|SUBMITTED|message
+2026-04-11T10:00:01Z|msg123|TX456|SUBMITTED|Hello world
 ```
 
-Example
-
+**delivery.log**
 ```
-2026-03-13T07:51:52Z|12345|TX123|SUBMITTED|hello
+2026-04-11T10:00:03Z|msg123|TX456|DELIVRD
 ```
 
 ---
 
-## Delivery Log
+## DLR Callback
 
-```
-timestamp|message_id|transaction_id|status
-```
-
-Example
-
-```
-2026-03-13T07:52:10Z|12345|TX123|DELIVRD
-```
-
----
-
-# Redis Usage
-
-Mapping stored as
-
-```
-sms:<message_id> → transaction_id
-```
-
-TTL
-
-```
-86400 seconds
-```
-
-Used for matching delivery receipts with original transactions.
-
----
-
-# DLR Callback
-
-Configured in
-
-```
-config/gateway.conf
-```
-
-Example
-
-```
-dlr_callback=http://localhost:9000/dlr
-```
-
-Payload
+POST to `dlr_callback` URL on delivery:
 
 ```json
 {
- "transaction_id":"TX123",
- "message_id":"12345",
- "status":"DELIVRD"
+  "transaction_id": "TX456",
+  "message_id":     "msg123",
+  "status":         "DELIVRD"
 }
 ```
 
 ---
 
-# Configuration
+## Configuration — `config/gateway.conf`
 
-File
-
-```
-config/gateway.conf
-```
-
-Example
-
-```
+```ini
+# Producer HTTP
 producer_port=8080
 producer_route=/send_sms
 
+# NATS JetStream
 nats_url=nats://127.0.0.1:4222
 nats_stream_name=SMS
-
 nats_subject_outgoing=sms.outgoing
 nats_subject_submit=sms.submit
 nats_subject_delivery=sms.delivery
+nats_consumer_smpp=smpp_consumer
 
+# Redis
 redis_host=127.0.0.1
 redis_port=6379
 
+# SMPP
 smpp_host=127.0.0.1
 smpp_port=2775
-
 smpp_system_id=test
 smpp_password=test
 smpp_system_type=SMPP
 
-smpp_workers=4
-smpp_window_size=20
+# Worker pool
+smpp_workers=4          # parallel bind_transceiver sessions
+smpp_window_size=20     # max in-flight submit_sm per worker
 
-tps=100
+# Throughput
+tps=100                 # global submissions per second (0 = unlimited)
 
+# DLR
 dlr_callback=http://localhost:9000/dlr
 
+# Logging
 log_dir=logs
+
+# Marketing send window — messages with message_type=marketing are
+# dropped outside this range. Use 00:00 / 23:59 to disable.
+send_window_morning=08:00
+send_window_evening=21:00
+
+# Prometheus metrics
+metrics_port=9091
 ```
 
 ---
 
-# Directory Structure
+## Directory Structure
 
 ```
-.
+smpp_client_c/
 ├── producer/
-│   └── producer.c
-│
+│   └── producer.c          HTTP server → JetStream publish
 ├── consumer/
-│   └── consumer.c
-│
+│   └── consumer.c          JetStream pull → SMPP workers
 ├── logger/
-│   └── logger.c
-│
+│   └── logger.c            JetStream pull → Redis + logs + DLR
 ├── common/
-│   ├── config.c
-│   ├── config.h
-│   ├── events.h
-│   ├── nats_bus.c
-│   └── redis_store.c
-│
+│   ├── config.c / config.h shared config loader
+│   ├── events.h            shared event struct definitions
+│   ├── nats_bus.c          NATS publish helper
+│   └── redis_store.c       Redis helper
 ├── config/
 │   └── gateway.conf
-│
-├── logs/
-│   ├── submit.log
-│   └── delivery.log
-│
-└── README.md
+└── logs/
+    ├── submit.log
+    └── delivery.log
 ```
 
 ---
 
-# Dependencies
+## Dependencies
 
-Required libraries
+| Library | Used by | Purpose |
+|---|---|---|
+| `libnats` | all | NATS JetStream client |
+| `libmicrohttpd` | producer | HTTP server |
+| `hiredis` | logger | Redis client |
+| `libcurl` | logger | DLR HTTP callback |
+| `pthread` | consumer | worker threads |
 
-```
-libnats
-libmicrohttpd
-hiredis
-libcurl
-pthread
-```
+**Ubuntu install**
 
----
-
-# Install Dependencies (Ubuntu)
-
-```
+```bash
 sudo apt install \
-libmicrohttpd-dev \
-libhiredis-dev \
-libcurl4-openssl-dev \
-libnats-dev
+  libmicrohttpd-dev \
+  libhiredis-dev \
+  libcurl4-openssl-dev \
+  libnats-dev
 ```
 
 ---
 
-# Build
+## Build
 
-Producer
-
-```
+```bash
+# Producer
 gcc producer/producer.c common/config.c \
--lmicrohttpd -lnats -o producer-server
-```
+    -lmicrohttpd -lnats \
+    -o producer-server
 
-Consumer
-
-```
+# Consumer
 gcc consumer/consumer.c common/config.c common/nats_bus.c \
--lnats -lpthread -o consumer-server
-```
+    -lnats -lpthread \
+    -o consumer-server
 
-Logger
-
-```
+# Logger
 gcc logger/logger.c common/config.c \
--lcurl -lhiredis -lnats -o logger-server
+    -lcurl -lhiredis -lnats \
+    -o logger-server
 ```
 
 ---
 
-# Run Order
+## Run Order
 
-Start services in this order
-
-### 1 Start NATS
-
-```
+```bash
+# 1. Infrastructure
 nats-server -js
-```
-
-### 2 Start Redis
-
-```
 redis-server
-```
 
-### 3 Start Producer
-
-```
+# 2. Gateway services (any order after infra is up)
 ./producer-server
-```
-
-### 4 Start Consumer
-
-```
 ./consumer-server
-```
-
-### 5 Start Logger
-
-```
 ./logger-server
 ```
 
 ---
 
-# Performance Control
+## Send a Message
 
-Throughput is controlled using
-
+```bash
+curl -s -X POST http://localhost:8080/send_sms \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transaction_id": "TX001",
+    "sender":         "MYAPP",
+    "destination":    "447700900000",
+    "message":        "Hello from the C gateway!",
+    "message_type":   "transactional"
+  }'
 ```
-tps=<value>
+
+**Long message (auto-split):**
+
+```bash
+curl -s -X POST http://localhost:8080/send_sms \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transaction_id": "TX002",
+    "sender":         "MYAPP",
+    "destination":    "447700900000",
+    "message":        "This message is longer than 160 characters so it will be automatically split into multiple SMS segments by the consumer, each carrying a User Data Header so the handset reassembles them in order.",
+    "message_type":   "transactional"
+  }'
 ```
 
-Example
+**Unicode message:**
 
+```bash
+curl -s -X POST http://localhost:8080/send_sms \
+  -H "Content-Type: application/json" \
+  -d '{
+    "transaction_id": "TX003",
+    "sender":         "MYAPP",
+    "destination":    "447700900000",
+    "message":        "مرحبا بالعالم",
+    "message_type":   "transactional"
+  }'
 ```
-tps=100
-```
-
-Consumer implements a **global TPS limiter** using a microsecond scheduler.
 
 ---
 
-# Feature Status
+## Metrics
 
-| Feature                      | Status                | Notes                             |
-| ---------------------------- | --------------------- | --------------------------------- |
-| HTTP SMS API                 | ✔ Implemented         | Producer accepts POST requests    |
-| JetStream event bus          | ✔ Implemented         | Stream auto created               |
-| Persistent message queue     | ✔ Implemented         | JetStream file storage            |
-| Pull-based consumer          | ✔ Implemented         | Consumer fetches batches          |
-| Multiple SMPP binds          | ✔ Implemented         | `smpp_workers` config             |
-| SMPP auto reconnect          | ✔ Implemented         | Worker reconnect loop             |
-| Submit response handling     | ✔ Implemented         | `submit_sm_resp` parsed           |
-| DLR parsing                  | ✔ Implemented         | `deliver_sm` processed            |
-| Redis message mapping        | ✔ Implemented         | message_id → transaction_id       |
-| Structured logging           | ✔ Implemented         | submit.log and delivery.log       |
-| DLR HTTP callback            | ✔ Implemented         | via libcurl                       |
-| Global TPS limiter           | ✔ Implemented         | nanosleep based scheduler         |
-| Config file loader           | ✔ Implemented         | gateway.conf                      |
-| JetStream stream auto-create | ✔ Implemented         | Producer ensures stream           |
-| SMPP window size config      | ⚠ Pending enforcement | parameter exists but not enforced |
-| SMPP enquire_link keepalive  | ⚠ Pending             | recommended for long sessions     |
-| Submit retry logic           | ⚠ Pending             | currently no retry queue          |
-| Dead letter queue            | ⚠ Pending             | possible via JetStream            |
-| Metrics / monitoring         | ⚠ Pending             | Prometheus / stats endpoint       |
-| Horizontal consumer scaling  | ⚠ Pending             | JetStream queue group scaling     |
+```bash
+curl http://localhost:9091/metrics
+```
+
+```
+sms_submitted_total{status="success"} 1024
+sms_submitted_total{status="failed"} 2
+sms_dlr_received_total 998
+smpp_sessions_connected 4
+sms_submit_rtt_ms_bucket{le="50"} 810
+sms_submit_rtt_ms_bucket{le="100"} 1020
+sms_submit_rtt_ms_bucket{le="+Inf"} 1024
+sms_submit_rtt_ms_sum 74210
+sms_submit_rtt_ms_count 1024
+```
 
 ---
 
-# Reliability Characteristics
+## Feature Status
 
-The system provides:
-
-* asynchronous processing
-* message persistence
-* automatic SMPP reconnection
-* delivery receipt tracking
-* Redis state mapping
-
-The design separates:
-
-```
-ingestion
-processing
-delivery
-logging
-```
-
-which makes the gateway scalable and fault tolerant.
-
----
-
-# Possible Future Enhancements
-
-Recommended improvements for carrier-grade deployments:
-
-* enforce SMPP window control
-* implement enquire_link keepalive
-* retry queue for failed submissions
-* dead letter queue
-* metrics and monitoring
-* SMPP bind pools
-* routing engine
-
+| Feature | Status | Notes |
+|---|---|---|
+| HTTP SMS API | ✅ | `POST /send_sms` |
+| JetStream stream auto-create | ✅ | Producer ensures stream on startup |
+| Pull-based consumer | ✅ | Batch fetch, JetStream ACK per message |
+| Multiple SMPP sessions | ✅ | `smpp_workers` parallel bind_transceiver |
+| SMPP window enforcement | ✅ | Per-worker `WindowSem`, blocks at `smpp_window_size` |
+| Global TPS limiter | ✅ | Microsecond-precision nanosleep scheduler |
+| GSM-7 single SMS | ✅ | ASCII ≤ 160 chars, `data_coding=0x00` |
+| UCS-2 single SMS | ✅ | Non-ASCII ≤ 70 chars, `data_coding=0x08` |
+| Long message (GSM-7) | ✅ | Auto-split at 153 chars/segment + UDH |
+| Long message (UCS-2) | ✅ | Auto-split at 67 chars/segment + UDH |
+| SMPP reconnect + backoff | ✅ | Exponential: 1s → 2s → … → 60s |
+| DLR parsing (`stat:` + `err:`) | ✅ | Full receipt field extraction |
+| Redis message mapping | ✅ | `sms:<msg_id>` → `tx_id`, TTL 86400s |
+| Redis reconnect | ✅ | Auto-reconnects on connection drop |
+| Structured logging | ✅ | `submit.log`, `delivery.log` |
+| DLR HTTP callback | ✅ | libcurl POST with JSON payload |
+| Marketing send window | ✅ | `send_window_morning` / `send_window_evening` |
+| Prometheus metrics | ✅ | Counters + RTT histogram on `metrics_port` |
+| Clean shutdown | ✅ | `SIGINT`/`SIGTERM` drains workers, joins threads |
+| SMPP enquire_link keepalive | ⚠️ | Not implemented — connections rely on OS TCP keepalive |
+| Submit retry queue | ⚠️ | Failed submits are dropped; no retry DLQ |
+| Horizontal consumer scaling | ⚠️ | Single process; scale via JetStream queue groups |

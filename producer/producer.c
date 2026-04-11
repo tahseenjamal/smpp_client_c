@@ -49,11 +49,13 @@ static int ensure_stream() {
 
     sc.Name = config.nats_stream_name;
 
-    const char* subjects[1];
+    const char* subjects[3];
     subjects[0] = config.nats_subject_outgoing;
+    subjects[1] = config.nats_subject_submit;
+    subjects[2] = config.nats_subject_delivery;
 
     sc.Subjects = subjects;
-    sc.SubjectsLen = 1;
+    sc.SubjectsLen = 3;
 
     sc.Storage = 1; /* file storage */
     sc.MaxMsgs = -1;
