@@ -103,16 +103,27 @@ sequenceDiagram
     Note over W: TPS wait
     Note over W: wsem_wait (window slot)
     W->>S: submit_sm (GSM-7 or UCS-2, single or multi-part)
-    S-->>W: submit_sm_resp + message_id
-    Note over W: wsem_post · rtt_observe()
-    W->>N: Publish → sms.submit
+    alt SMSC accepts
+        S-->>W: submit_sm_resp (status=0) + message_id
+        Note over W: wsem_post · rtt_observe()
+        W->>N: Publish → sms.submit  {status:"SUBMITTED"}
+    else SMSC rejects
+        S-->>W: submit_sm_resp (status≠0)
+        Note over W: wsem_post · rtt_observe()
+        W->>N: Publish → sms.submit  {status:"ERROR:0x..."}
+    else No response within smpp_resp_timeout_ms
+        Note over W: resp_reaper thread detects stale seq
+        Note over W: wsem_post (slot recovered)
+        W->>N: Publish → sms.submit  {status:"TIMEOUT"}
+    end
 
     S-->>W: deliver_sm (id: stat: err:)
     W->>N: Publish → sms.delivery
 
     L->>N: Fetch sms.submit
+    Note over L: Only SETEX when status=SUBMITTED
     L->>R: SETEX sms:<msg_id> 86400 <tx_id>
-    L->>L: append submit.log
+    L->>L: append submit.log  (SUBMITTED / ERROR / TIMEOUT)
 
     L->>N: Fetch sms.delivery
     L->>R: GET sms:<msg_id>
@@ -131,7 +142,7 @@ stateDiagram-v2
     Connecting --> Backing_off : connect failed
     Backing_off --> Connecting : sleep(backoff)\nbackoff = min(backoff×2, 60s)
     Connected --> Reading : bind_transceiver_resp OK\nm_sessions++
-    Reading --> Reading : submit_sm_resp → wsem_post + RTT\ndeliver_sm → parse stat/err
+    Reading --> Reading : submit_sm_resp (ok/err) → wsem_post + RTT\ndeliver_sm → parse stat/err\nreaper → release stale window slot
     Reading --> Disconnected : read error / socket closed
     Disconnected --> Backing_off : m_sessions--\nwsem_reset\nclose socket
     Disconnected --> [*] : running == 0
@@ -181,6 +192,9 @@ Pull-based JetStream consumer that owns all SMPP state.
 | **DLR parsing** | Extracts `id:`, `stat:`, and `err:` from receipt text |
 | **Marketing window** | Drops `marketing` messages outside `send_window_morning`–`send_window_evening` |
 | **Metrics** | Prometheus text endpoint on `metrics_port` |
+| **Resp timeout reaper** | Background thread recovers window slots for unacknowledged PDUs after `smpp_resp_timeout_ms`; publishes TIMEOUT event to submit log |
+| **SMSC error detection** | Non-zero `submit_sm_resp` status logged as `ERROR:0x...` in submit.log; only `SUBMITTED` counted as success in metrics |
+| **Configurable retry** | `smpp_retry_on_fail=1` NAKs the NATS message on write failure (requeues for retry); `0` ACKs and drops |
 | **Shutdown** | `SIGINT`/`SIGTERM` drains workers cleanly via `pthread_join` |
 
 **Prometheus metrics exposed**
@@ -208,9 +222,20 @@ Pull-based JetStream consumer on `sms.submit` and `sms.delivery`.
 
 ## Log Formats
 
-**submit.log**
+**submit.log** — one row per `submit_sm_resp` (or timeout)
+
+| Field | Description |
+|---|---|
+| timestamp | UTC ISO-8601 |
+| message_id | SMSC-assigned ID (empty on ERROR/TIMEOUT) |
+| transaction_id | caller's TX ID |
+| status | `SUBMITTED`, `ERROR:0x<hex>`, or `TIMEOUT` |
+| message | original message text |
+
 ```
 2026-04-11T10:00:01Z|msg123|TX456|SUBMITTED|Hello world
+2026-04-11T10:00:02Z||TX789|ERROR:0x00000045|Bad destination
+2026-04-11T10:00:07Z||TX999|TIMEOUT|Unresponsive SMSC
 ```
 
 **delivery.log**
@@ -280,6 +305,14 @@ send_window_evening=21:00
 
 # Prometheus metrics
 metrics_port=9091
+
+# submit_sm_resp timeout: release window slot if no response within N ms.
+# 0 disables the timeout.
+smpp_resp_timeout_ms=5000
+
+# 1 = NAK the NATS message on socket write failure so it requeues for retry.
+# 0 = ACK and drop.
+smpp_retry_on_fail=1
 ```
 
 ---
@@ -452,7 +485,10 @@ sms_submit_rtt_ms_count 1024
 | DLR HTTP callback | ✅ | libcurl POST with JSON payload |
 | Marketing send window | ✅ | `send_window_morning` / `send_window_evening` |
 | Prometheus metrics | ✅ | Counters + RTT histogram on `metrics_port` |
+| submit_sm_resp timeout reaper | ✅ | `smpp_resp_timeout_ms`; background thread recovers stale window slots; logs TIMEOUT |
+| SMSC error status detection | ✅ | Non-zero resp status → `ERROR:0x...` in submit.log; not counted as success |
+| Configurable NAK on write fail | ✅ | `smpp_retry_on_fail=1` requeues; `0` drops |
 | Clean shutdown | ✅ | `SIGINT`/`SIGTERM` drains workers, joins threads |
 | SMPP enquire_link keepalive | ⚠️ | Not implemented — connections rely on OS TCP keepalive |
-| Submit retry queue | ⚠️ | Failed submits are dropped; no retry DLQ |
+| Submit retry queue | ⚠️ | Write failures requeue via NAK (`smpp_retry_on_fail=1`); no dead-letter queue |
 | Horizontal consumer scaling | ⚠️ | Single process; scale via JetStream queue groups |

@@ -381,7 +381,7 @@ static uint32_t smpp_send_pdu(SmppWorker* w, const char* from, const char* to,
                                uint8_t data_coding, uint8_t esm_class,
                                const uint8_t* msg_data, int msg_len,
                                const char* txid, const char* full_text) {
-    uint8_t pdu[512];
+    uint8_t pdu[1024]; /* 16 hdr + 2 addr fields(≤32B each) + 159B max segment + margin */
     int pos = 16;
 
     pdu[pos++] = 0;             /* service_type (empty C-string) */
@@ -435,10 +435,10 @@ static uint32_t smpp_send_pdu(SmppWorker* w, const char* from, const char* to,
         perror("[SMPP] submit write");
         wsem_post(&w->window);
         atomic_fetch_add(&m_submit_err, 1);
-        return seq;
+        return 0; /* 0 = definite failure: caller can NAK */
     }
 
-    atomic_fetch_add(&m_submit_ok, 1);
+    /* m_submit_ok is counted in the submit_sm_resp handler once SMSC confirms. */
     return seq;
 }
 
@@ -578,16 +578,18 @@ void* smpp_read_loop(void* arg) {
         else if (cmd == 0x80000004) {
             char message_id[64] = {0};
 
-            size_t mid_len = strnlen((char*)body, len - 16);
-            if (mid_len > sizeof(message_id) - 1)
-                mid_len = sizeof(message_id) - 1;
-
-            memcpy(message_id, body, mid_len);
+            if (status == 0) {
+                /* body is the SMSC-assigned message_id string */
+                size_t mid_len = strnlen((char*)body, len - 16);
+                if (mid_len > sizeof(message_id) - 1)
+                    mid_len = sizeof(message_id) - 1;
+                memcpy(message_id, body, mid_len);
+            }
 
             int idx = seq % MAX_SEQ;
 
-            char txid[64];
-            char text[512];
+            char txid[64]  = {0};
+            char text[512] = {0};
             long sub_us;
 
             pthread_mutex_lock(&w->lock);
@@ -596,24 +598,33 @@ void* smpp_read_loop(void* arg) {
             snprintf(text, sizeof(text), "%s", w->seq_map[idx].text);
             sub_us = w->seq_map[idx].submit_us;
 
-            /* clear mapping */
-            w->seq_map[idx].txid[0]    = 0;
-            w->seq_map[idx].text[0]    = 0;
-            w->seq_map[idx].submit_us  = 0;
+            w->seq_map[idx].txid[0]   = 0;
+            w->seq_map[idx].text[0]   = 0;
+            w->seq_map[idx].submit_us = 0;
 
             pthread_mutex_unlock(&w->lock);
 
-            /* release the window slot and record RTT */
             wsem_post(&w->window);
             if (sub_us > 0)
                 rtt_observe((now_us() - sub_us) / 1000);
+
+            char ev_status[32];
+            if (status == 0) {
+                snprintf(ev_status, sizeof(ev_status), "SUBMITTED");
+                atomic_fetch_add(&m_submit_ok, 1);
+            } else {
+                snprintf(ev_status, sizeof(ev_status), "ERROR:0x%08X", status);
+                atomic_fetch_add(&m_submit_err, 1);
+                printf("[SMPP] Worker %d submit_sm_resp error seq=%u "
+                       "status=0x%08X txid=%s\n", w->id, seq, status, txid);
+            }
 
             char json[512];
 
             snprintf(json, sizeof(json),
                      "{\"message_id\":\"%s\",\"transaction_id\":\"%s\","
-                     "\"message\":\"%s\"}",
-                     message_id, txid, text);
+                     "\"message\":\"%s\",\"status\":\"%s\"}",
+                     message_id, txid, text, ev_status);
 
             publish_event(nc, config.nats_subject_submit, json);
         }
@@ -851,6 +862,74 @@ static void* metrics_server(void* arg) {
 }
 
 /* ------------------------------------------------ */
+/* submit_sm_resp timeout reaper                    */
+/* ------------------------------------------------ */
+
+/*
+ * Runs every second.  Scans all workers' seq_maps for entries whose
+ * submit_us is older than smpp_resp_timeout_ms.  For each one:
+ *   - clears the slot
+ *   - releases the window semaphore
+ *   - publishes a TIMEOUT submit event so the logger records it
+ *   - increments m_submit_err
+ *
+ * Uses per-worker lock → wsem_post ordering (same as the read loop),
+ * so no deadlock is possible.
+ */
+static void* resp_reaper(void* arg) {
+    (void)arg;
+
+    while (running) {
+        sleep(1);
+
+        if (config.smpp_resp_timeout_ms <= 0) continue;
+
+        long timeout_us = (long)config.smpp_resp_timeout_ms * 1000L;
+        long now        = now_us();
+
+        for (int wi = 0; wi < worker_count; wi++) {
+            SmppWorker* w = &workers[wi];
+
+            /* Collect expired entries under lock, process outside. */
+            struct { char txid[64]; char text[512]; } expired[32];
+            int ne = 0;
+
+            pthread_mutex_lock(&w->lock);
+            for (int i = 0; i < MAX_SEQ && ne < 32; i++) {
+                if (w->seq_map[i].submit_us == 0) continue;
+                if (now - w->seq_map[i].submit_us <= timeout_us) continue;
+
+                snprintf(expired[ne].txid, 64,  "%s", w->seq_map[i].txid);
+                snprintf(expired[ne].text, 512, "%s", w->seq_map[i].text);
+                ne++;
+
+                w->seq_map[i].txid[0]   = 0;
+                w->seq_map[i].text[0]   = 0;
+                w->seq_map[i].submit_us = 0;
+            }
+            pthread_mutex_unlock(&w->lock);
+
+            for (int e = 0; e < ne; e++) {
+                printf("[SMPP] Worker %d resp timeout txid=%s\n",
+                       w->id, expired[e].txid);
+
+                char json[512];
+                snprintf(json, sizeof(json),
+                         "{\"message_id\":\"\",\"transaction_id\":\"%s\","
+                         "\"message\":\"%s\",\"status\":\"TIMEOUT\"}",
+                         expired[e].txid, expired[e].text);
+
+                publish_event(nc, config.nats_subject_submit, json);
+                wsem_post(&w->window);
+                atomic_fetch_add(&m_submit_err, 1);
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/* ------------------------------------------------ */
 int main() {
     if (load_config("config/gateway.conf") != 0) return 1;
 
@@ -894,6 +973,14 @@ int main() {
         pthread_t metrics_tid;
         pthread_create(&metrics_tid, NULL, metrics_server, &config.metrics_port);
         pthread_detach(metrics_tid);
+    }
+
+    if (config.smpp_resp_timeout_ms > 0) {
+        pthread_t reaper_tid;
+        pthread_create(&reaper_tid, NULL, resp_reaper, NULL);
+        pthread_detach(reaper_tid);
+        printf("[Consumer] resp timeout reaper started (%dms)\n",
+               config.smpp_resp_timeout_ms);
     }
 
     jsCtx* js = NULL;
@@ -963,9 +1050,18 @@ int main() {
             SmppWorker* w = &workers[rr++ % worker_count];
 
             global_tps_wait();
-            smpp_submit(w, sender, dest, text, txid);
+            uint32_t seq = smpp_submit(w, sender, dest, text, txid);
 
-            natsMsg_Ack(msgs.Msgs[i], NULL);
+            /*
+             * seq == 0 means the write to the socket failed (worker
+             * disconnected).  When retry is enabled, NAK the message so
+             * NATS redelivers it once the worker reconnects.
+             */
+            if (seq == 0 && config.smpp_retry_on_fail) {
+                natsMsg_Nak(msgs.Msgs[i], NULL);
+            } else {
+                natsMsg_Ack(msgs.Msgs[i], NULL);
+            }
         }
 
         natsMsgList_Destroy(&msgs);

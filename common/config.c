@@ -103,6 +103,12 @@ static void set_value(const char* key, const char* value) {
 
     else if (strcmp(key, "metrics_port") == 0)
         config.metrics_port = atoi(value);
+
+    else if (strcmp(key, "smpp_resp_timeout_ms") == 0)
+        config.smpp_resp_timeout_ms = atoi(value);
+
+    else if (strcmp(key, "smpp_retry_on_fail") == 0)
+        config.smpp_retry_on_fail = atoi(value);
 }
 
 /* load config file */

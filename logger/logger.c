@@ -95,24 +95,35 @@ void send_dlr_callback(const char* txid, const char* message_id,
 
 void process_submit(const char* payload) {
     char message_id[64] = {0};
-    char txid[64] = {0};
-    char message[512] = {0};
+    char txid[64]       = {0};
+    char message[512]   = {0};
+    char status[32]     = {0};
 
-    extract_json(payload, "message_id", message_id, sizeof(message_id));
-    extract_json(payload, "transaction_id", txid, sizeof(txid));
-    extract_json(payload, "message", message, sizeof(message));
+    extract_json(payload, "message_id",     message_id, sizeof(message_id));
+    extract_json(payload, "transaction_id", txid,       sizeof(txid));
+    extract_json(payload, "message",        message,    sizeof(message));
+    extract_json(payload, "status",         status,     sizeof(status));
+
+    /* default for older events that predate the status field */
+    if (status[0] == '\0') strncpy(status, "SUBMITTED", sizeof(status));
 
     char ts[64];
     now(ts, sizeof(ts));
 
-    ensure_redis();
-    if (redis) {
-        redisReply* r =
-            redisCommand(redis, "SETEX sms:%s 86400 %s", message_id, txid);
-        if (r) freeReplyObject(r);
+    /*
+     * Only store the Redis mapping when the SMSC confirmed the submission.
+     * ERROR / TIMEOUT events have no valid message_id to key on.
+     */
+    if (strcmp(status, "SUBMITTED") == 0 && message_id[0] != '\0') {
+        ensure_redis();
+        if (redis) {
+            redisReply* r =
+                redisCommand(redis, "SETEX sms:%s 86400 %s", message_id, txid);
+            if (r) freeReplyObject(r);
+        }
     }
 
-    fprintf(submit_log, "%s|%s|%s|SUBMITTED|%s\n", ts, message_id, txid,
+    fprintf(submit_log, "%s|%s|%s|%s|%s\n", ts, message_id, txid, status,
             message);
 }
 

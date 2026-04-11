@@ -36,6 +36,9 @@ typedef struct {
 
     int metrics_port;             /* Prometheus /metrics HTTP port          */
 
+    int smpp_resp_timeout_ms;     /* ms to wait for submit_sm_resp (0=off)  */
+    int smpp_retry_on_fail;       /* 1 = NAK NATS msg on write failure      */
+
 } GatewayConfig;
 
 extern GatewayConfig config;
